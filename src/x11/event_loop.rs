@@ -8,7 +8,7 @@ use std::error::Error;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _};
+use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _, KeyReleaseEvent};
 use x11rb::protocol::Event as XEvent;
 
 pub(super) struct EventLoop {
@@ -19,6 +19,7 @@ pub(super) struct EventLoop {
     new_physical_size: Option<PhySize>,
     frame_interval: Duration,
     event_loop_running: bool,
+    pressed_keys: [bool; 256],
 }
 
 impl EventLoop {
@@ -33,6 +34,7 @@ impl EventLoop {
             frame_interval: Duration::from_millis(15),
             event_loop_running: false,
             new_physical_size: None,
+            pressed_keys: [false; 256],
         }
     }
 
@@ -43,8 +45,40 @@ impl EventLoop {
         // when they've all been coalesced.
         self.new_physical_size = None;
 
+        // Core X11 autorepeat is encoded as an adjacent KeyRelease/KeyPress
+        // pair with the same keycode and timestamp. Normalize that protocol
+        // detail here so every downstream UI receives one repeated key-down
+        // instead of a false release followed by a fresh press.
+        let mut pending_key_release = None;
         while let Some(event) = self.window.xcb_connection.conn.poll_for_event()? {
-            self.handle_xcb_event(event);
+            match event {
+                XEvent::KeyRelease(release) => {
+                    if let Some(previous) = pending_key_release.replace(release) {
+                        self.handle_key_release(previous);
+                    }
+                }
+                XEvent::KeyPress(press) => {
+                    if pending_key_release.as_ref().is_some_and(|release| {
+                        release.detail == press.detail
+                            && release.time == press.time
+                            && release.event == press.event
+                    }) {
+                        pending_key_release = None;
+                    } else if let Some(release) = pending_key_release.take() {
+                        self.handle_key_release(release);
+                    }
+                    self.handle_key_press(press);
+                }
+                event => {
+                    if let Some(release) = pending_key_release.take() {
+                        self.handle_key_release(release);
+                    }
+                    self.handle_xcb_event(event);
+                }
+            }
+        }
+        if let Some(release) = pending_key_release {
+            self.handle_key_release(release);
         }
 
         // A `set_scale_factor` call stashes the new content scale here; apply
@@ -258,11 +292,11 @@ impl EventLoop {
             // keys
             ////
             XEvent::KeyPress(event) => {
-                self.handle_event(Event::Keyboard(convert_key_press_event(&event)));
+                self.handle_key_press(event);
             }
 
             XEvent::KeyRelease(event) => {
-                self.handle_event(Event::Keyboard(convert_key_release_event(&event)));
+                self.handle_key_release(event);
             }
 
             XEvent::FocusIn(_) => {
@@ -270,11 +304,25 @@ impl EventLoop {
             }
 
             XEvent::FocusOut(_) => {
+                self.pressed_keys.fill(false);
                 self.handle_event(Event::Window(WindowEvent::Unfocused));
             }
 
             _ => {}
         }
+    }
+
+    fn handle_key_press(&mut self, event: x11rb::protocol::xproto::KeyPressEvent) {
+        let pressed = &mut self.pressed_keys[usize::from(event.detail)];
+        let mut keyboard_event = convert_key_press_event(&event);
+        keyboard_event.repeat = *pressed;
+        *pressed = true;
+        self.handle_event(Event::Keyboard(keyboard_event));
+    }
+
+    fn handle_key_release(&mut self, event: KeyReleaseEvent) {
+        self.pressed_keys[usize::from(event.detail)] = false;
+        self.handle_event(Event::Keyboard(convert_key_release_event(&event)));
     }
 
     fn handle_event(&mut self, event: Event) {
