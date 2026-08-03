@@ -8,6 +8,32 @@ use crate::event::{Event, EventStatus};
 use crate::window_open_options::WindowOpenOptions;
 use crate::{MouseCursor, Size};
 
+/// An X11 drag could not be registered with this window's live event queue.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MatariX11ScheduleError {
+    /// The primary pointer gesture is no longer owned by this editor.
+    AuthorityUnavailable,
+    /// Another outbound drag already owns this editor's X11 queue.
+    Busy,
+    /// The editor did not expose a usable X11 window handle.
+    MissingWindowHandle,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for MatariX11ScheduleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::AuthorityUnavailable => "X11 drag requires the current primary pointer gesture",
+            Self::Busy => "an X11 drag is already active for this window",
+            Self::MissingWindowHandle => "the editor does not expose a valid X11 window handle",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for MatariX11ScheduleError {}
+
 #[cfg(target_os = "macos")]
 use crate::macos as platform;
 #[cfg(target_os = "windows")]
@@ -57,6 +83,26 @@ pub struct Window<'a> {
 }
 
 impl<'a> Window<'a> {
+    /// Whether this callback has the primary-pointer authority required to
+    /// start an X11 outbound file drag.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn can_schedule_matari_x11_drag(&self) -> bool {
+        self.window.can_schedule_matari_x11_drag()
+    }
+
+    /// Start an outbound X11 drag from the live toolkit-owned event queue.
+    ///
+    /// The ticket is returned unchanged when the gesture cannot be committed;
+    /// once native startup begins, lifecycle failures are reported by Matari.
+    #[cfg(target_os = "linux")]
+    pub fn schedule_matari_x11_drag(
+        &self,
+        ticket: matari_audio_drag_and_drop::StartTicket,
+    ) -> Result<(), matari_audio_drag_and_drop::RejectedStart<MatariX11ScheduleError>> {
+        self.window.schedule_matari_x11_drag(ticket)
+    }
+
     #[cfg(target_os = "windows")]
     pub(crate) fn new(window: platform::Window<'a>) -> Window<'a> {
         Window { window, phantom: PhantomData }

@@ -8,8 +8,9 @@ use std::error::Error;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _};
+use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _, KeyButMask};
 use x11rb::protocol::Event as XEvent;
+use matari_audio_drag_and_drop::X11SessionStatus;
 
 pub(super) struct EventLoop {
     handler: Box<dyn WindowHandler>,
@@ -154,6 +155,9 @@ impl EventLoop {
         //   the keyboard modifier keys at the time of the event.
         //   http://rtbo.github.io/rust-xcb/src/xcb/ffi/xproto.rs.html#445
 
+        self.update_pointer_authority(&event);
+        self.forward_matari_drag_event(&event);
+
         match event {
             ////
             // window
@@ -277,6 +281,69 @@ impl EventLoop {
         }
     }
 
+    fn update_pointer_authority(&self, event: &XEvent) {
+        let pointer = match event {
+            XEvent::MotionNotify(event) => {
+                self.window
+                    .primary_pointer_down
+                    .set(event.state.contains(KeyButMask::BUTTON1));
+                Some(matari_audio_drag_and_drop::X11PointerEvent {
+                    root: event.root,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    time: event.time,
+                })
+            }
+            XEvent::ButtonPress(event) => {
+                if event.detail == 1 {
+                    self.window.primary_pointer_down.set(true);
+                }
+                Some(matari_audio_drag_and_drop::X11PointerEvent {
+                    root: event.root,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    time: event.time,
+                })
+            }
+            XEvent::ButtonRelease(event) => Some(matari_audio_drag_and_drop::X11PointerEvent {
+                root: event.root,
+                root_x: event.root_x,
+                root_y: event.root_y,
+                time: event.time,
+            }),
+            _ => None,
+        };
+        if let Some(pointer) = pointer {
+            self.window.last_pointer_event.set(Some(pointer));
+        }
+    }
+
+    fn forward_matari_drag_event(&self, event: &XEvent) {
+        let connection = self.window.xcb_connection.conn.xcb_connection();
+        let Some(mut session) = self.window.external_drag_session.borrow_mut().take() else {
+            if matches!(event, XEvent::ButtonRelease(event) if event.detail == 1) {
+                self.window.primary_pointer_down.set(false);
+            }
+            return;
+        };
+        match session.handle_event(connection, event) {
+            Ok(X11SessionStatus::Active) => {
+                *self.window.external_drag_session.borrow_mut() = Some(session);
+            }
+            Ok(X11SessionStatus::Finished) | Err(_) => {}
+        }
+        if matches!(event, XEvent::ButtonRelease(event) if event.detail == 1) {
+            self.window.primary_pointer_down.set(false);
+        }
+    }
+
+    fn cancel_matari_drag(&self) {
+        let connection = self.window.xcb_connection.conn.xcb_connection();
+        if let Some(session) = self.window.external_drag_session.borrow_mut().take() {
+            let _ = session.cancel(connection);
+        }
+    }
+
     fn handle_event(&mut self, event: Event) {
         self.handler.on_event(&mut crate::Window::new(Window { inner: &self.window }), event);
     }
@@ -287,6 +354,7 @@ impl EventLoop {
     }
 
     fn handle_must_close(&mut self) {
+        self.cancel_matari_drag();
         self.handle_event(Event::Window(WindowEvent::WillClose));
 
         self.event_loop_running = false;

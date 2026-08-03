@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -10,6 +10,10 @@ use std::thread::{self, JoinHandle};
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle, XlibDisplayHandle,
     XlibWindowHandle,
+};
+use raw_window_handle_06::{
+    RawDisplayHandle as RawDisplayHandle06, RawWindowHandle as RawWindowHandle06,
+    XlibDisplayHandle as XlibDisplayHandle06, XlibWindowHandle as XlibWindowHandle06,
 };
 
 use x11rb::connection::Connection;
@@ -29,6 +33,9 @@ use crate::{
 use crate::gl::{platform, GlContext};
 use crate::x11::event_loop::EventLoop;
 use crate::x11::visual_info::WindowVisualConfig;
+use matari_audio_drag_and_drop::{
+    DragOrigin, RejectedStart, StartTicket, X11PointerEvent, X11Session,
+};
 
 pub struct WindowHandle {
     raw_window_handle: Option<RawWindowHandle>,
@@ -117,10 +124,39 @@ pub(crate) struct WindowInner {
     /// resulting `ConfigureNotify` so the new physical size is converted to
     /// logical at the new scale rather than the stale creation-time scale.
     pub(crate) pending_scale: Cell<Option<f64>>,
+
+    pub(crate) last_pointer_event: Cell<Option<X11PointerEvent>>,
+    pub(crate) primary_pointer_down: Cell<bool>,
+    pub(crate) external_drag_session: RefCell<Option<X11Session>>,
 }
 
 pub struct Window<'a> {
     pub(crate) inner: &'a WindowInner,
+}
+
+struct MatariOriginWindow {
+    window: RawWindowHandle06,
+    display: RawDisplayHandle06,
+}
+
+impl raw_window_handle_06::HasWindowHandle for MatariOriginWindow {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle_06::WindowHandle<'_>, raw_window_handle_06::HandleError> {
+        // SAFETY: the X11 ID and display pointer belong to WindowInner and stay
+        // valid for the duration of the synchronous Matari start call.
+        Ok(unsafe { raw_window_handle_06::WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+impl raw_window_handle_06::HasDisplayHandle for MatariOriginWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle_06::DisplayHandle<'_>, raw_window_handle_06::HandleError> {
+        // SAFETY: the Xlib display pointer is owned by WindowInner and remains
+        // alive while this short-lived adapter is used.
+        Ok(unsafe { raw_window_handle_06::DisplayHandle::borrow_raw(self.display) })
+    }
 }
 
 // Hack to allow sending a RawWindowHandle between threads. Do not make public
@@ -311,6 +347,10 @@ impl<'a> Window<'a> {
 
             pending_scale: Cell::new(None),
 
+            last_pointer_event: Cell::new(None),
+            primary_pointer_down: Cell::new(false),
+            external_drag_session: RefCell::new(None),
+
             #[cfg(feature = "opengl")]
             gl_context,
         };
@@ -405,6 +445,54 @@ impl<'a> Window<'a> {
         // `Resized`. Do NOT resize the child - re-scaling must not fight the
         // host's own sizing of the embed parent.
         self.inner.pending_scale.set(Some(scale));
+    }
+
+    pub fn can_schedule_matari_x11_drag(&self) -> bool {
+        self.inner
+            .external_drag_session
+            .borrow()
+            .as_ref()
+            .is_none()
+            && self.inner.primary_pointer_down.get()
+            && self.inner.last_pointer_event.get().is_some()
+    }
+
+    pub fn schedule_matari_x11_drag(
+        &self,
+        ticket: StartTicket,
+    ) -> Result<(), RejectedStart<crate::MatariX11ScheduleError>> {
+        if self
+            .inner
+            .external_drag_session
+            .borrow()
+            .as_ref()
+            .is_some()
+        {
+            return Err(ticket.reject(crate::MatariX11ScheduleError::Busy));
+        }
+        let Some(press) = self.inner.last_pointer_event.get() else {
+            return Err(ticket.reject(crate::MatariX11ScheduleError::AuthorityUnavailable));
+        };
+        if !self.inner.primary_pointer_down.get() {
+            return Err(ticket.reject(crate::MatariX11ScheduleError::AuthorityUnavailable));
+        }
+        let display = self.inner.xcb_connection.conn.xlib_display();
+        let origin_window = MatariOriginWindow {
+            window: RawWindowHandle06::Xlib(XlibWindowHandle06::new(self.inner.window_id.into())),
+            display: RawDisplayHandle06::Xlib(XlibDisplayHandle06::new(
+                std::ptr::NonNull::new(display.cast()),
+                self.inner.xcb_connection.conn.default_screen(),
+            )),
+        };
+        let Ok(origin) = DragOrigin::from_window(&origin_window) else {
+            return Err(ticket.reject(crate::MatariX11ScheduleError::MissingWindowHandle));
+        };
+        let connection = self.inner.xcb_connection.conn.xcb_connection();
+        let Ok(session) = ticket.start_x11(connection, origin, press) else {
+            return Ok(());
+        };
+        *self.inner.external_drag_session.borrow_mut() = Some(session);
+        Ok(())
     }
 
     #[cfg(feature = "opengl")]
