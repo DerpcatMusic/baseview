@@ -34,6 +34,17 @@ impl std::fmt::Display for MatariX11ScheduleError {
 #[cfg(target_os = "linux")]
 impl std::error::Error for MatariX11ScheduleError {}
 
+#[cfg(target_os = "linux")]
+impl From<matari_audio_drag_and_drop::toolkit::X11HostError> for MatariX11ScheduleError {
+    fn from(error: matari_audio_drag_and_drop::toolkit::X11HostError) -> Self {
+        use matari_audio_drag_and_drop::toolkit::X11HostError;
+        match error {
+            X11HostError::Busy => Self::Busy,
+            X11HostError::PointerAuthorityUnavailable => Self::AuthorityUnavailable,
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 use crate::macos as platform;
 #[cfg(target_os = "windows")]
@@ -91,14 +102,25 @@ impl<'a> Window<'a> {
         self.window.can_schedule_matari_x11_drag()
     }
 
+    /// Whether this window installed Matari's inbound drop router.
+    ///
+    /// `false` is expected on compositors that deliver XDND to an embedded
+    /// editor directly. `false` together with a Hyprland bridge in
+    /// [`matari_audio_drag_and_drop::x11_bridge_report`] means inbound drops
+    /// cannot arrive, and is worth logging.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn x11_drop_router_active(&self) -> bool {
+        self.window.x11_drop_router_active()
+    }
+
     /// Start an outbound X11 drag from the live toolkit-owned event queue.
     ///
     /// The ticket is returned unchanged when the gesture cannot be committed;
     /// once native startup begins, lifecycle failures are reported by Matari.
     #[cfg(target_os = "linux")]
     pub fn schedule_matari_x11_drag(
-        &self,
-        ticket: matari_audio_drag_and_drop::StartTicket,
+        &self, ticket: matari_audio_drag_and_drop::StartTicket,
     ) -> Result<(), matari_audio_drag_and_drop::RejectedStart<MatariX11ScheduleError>> {
         self.window.schedule_matari_x11_drag(ticket)
     }

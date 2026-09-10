@@ -33,9 +33,8 @@ use crate::{
 use crate::gl::{platform, GlContext};
 use crate::x11::event_loop::EventLoop;
 use crate::x11::visual_info::WindowVisualConfig;
-use matari_audio_drag_and_drop::{
-    DragOrigin, RejectedStart, StartTicket, X11PointerEvent, X11Session,
-};
+use matari_audio_drag_and_drop::toolkit::X11Host;
+use matari_audio_drag_and_drop::{DragOrigin, RejectedStart, StartTicket};
 
 pub struct WindowHandle {
     raw_window_handle: Option<RawWindowHandle>,
@@ -125,9 +124,9 @@ pub(crate) struct WindowInner {
     /// logical at the new scale rather than the stale creation-time scale.
     pub(crate) pending_scale: Cell<Option<f64>>,
 
-    pub(crate) last_pointer_event: Cell<Option<X11PointerEvent>>,
-    pub(crate) primary_pointer_down: Cell<bool>,
-    pub(crate) external_drag_session: RefCell<Option<X11Session>>,
+    /// Pointer authority, the live outbound session, and the inbound drop
+    /// router, all owned by Matari rather than tracked field by field here.
+    pub(crate) matari: RefCell<X11Host>,
 }
 
 pub struct Window<'a> {
@@ -347,9 +346,7 @@ impl<'a> Window<'a> {
 
             pending_scale: Cell::new(None),
 
-            last_pointer_event: Cell::new(None),
-            primary_pointer_down: Cell::new(false),
-            external_drag_session: RefCell::new(None),
+            matari: RefCell::new(X11Host::new()),
 
             #[cfg(feature = "opengl")]
             gl_context,
@@ -448,34 +445,16 @@ impl<'a> Window<'a> {
     }
 
     pub fn can_schedule_matari_x11_drag(&self) -> bool {
-        self.inner
-            .external_drag_session
-            .borrow()
-            .as_ref()
-            .is_none()
-            && self.inner.primary_pointer_down.get()
-            && self.inner.last_pointer_event.get().is_some()
+        self.inner.matari.borrow().can_start_drag()
+    }
+
+    pub fn x11_drop_router_active(&self) -> bool {
+        self.inner.matari.borrow().router_active()
     }
 
     pub fn schedule_matari_x11_drag(
-        &self,
-        ticket: StartTicket,
+        &self, ticket: StartTicket,
     ) -> Result<(), RejectedStart<crate::MatariX11ScheduleError>> {
-        if self
-            .inner
-            .external_drag_session
-            .borrow()
-            .as_ref()
-            .is_some()
-        {
-            return Err(ticket.reject(crate::MatariX11ScheduleError::Busy));
-        }
-        let Some(press) = self.inner.last_pointer_event.get() else {
-            return Err(ticket.reject(crate::MatariX11ScheduleError::AuthorityUnavailable));
-        };
-        if !self.inner.primary_pointer_down.get() {
-            return Err(ticket.reject(crate::MatariX11ScheduleError::AuthorityUnavailable));
-        }
         let display = self.inner.xcb_connection.conn.xlib_display();
         let origin_window = MatariOriginWindow {
             window: RawWindowHandle06::Xlib(XlibWindowHandle06::new(self.inner.window_id.into())),
@@ -487,12 +466,11 @@ impl<'a> Window<'a> {
         let Ok(origin) = DragOrigin::from_window(&origin_window) else {
             return Err(ticket.reject(crate::MatariX11ScheduleError::MissingWindowHandle));
         };
-        let connection = self.inner.xcb_connection.conn.xcb_connection();
-        let Ok(session) = ticket.start_x11(connection, origin, press) else {
-            return Ok(());
-        };
-        *self.inner.external_drag_session.borrow_mut() = Some(session);
-        Ok(())
+        self.inner
+            .matari
+            .borrow_mut()
+            .start_drag(self.inner.xcb_connection.conn.xcb_connection(), origin, ticket)
+            .map_err(|rejected| rejected.map_error(crate::MatariX11ScheduleError::from))
     }
 
     #[cfg(feature = "opengl")]
