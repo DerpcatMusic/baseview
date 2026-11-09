@@ -360,3 +360,86 @@ fn fetch_window_info(
 
     Ok(Some((mapped, tree)))
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "native test setup fails on X11 errors"
+)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
+    use x11rb::protocol::Event;
+
+    #[test]
+    #[ignore = "requires an X11 display"]
+    fn reparented_hidden_ancestor_tracks_mapping() {
+        let (host, screen) = x11rb::connect(None).unwrap();
+        let root = host.setup().roots[screen].root;
+        let make_window = |parent| {
+            let id = host.generate_id().unwrap();
+            host.create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                id,
+                parent,
+                0,
+                0,
+                64,
+                64,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+            id
+        };
+        let hidden = make_window(root);
+        let parent = make_window(root);
+        let child = make_window(parent);
+        host.map_window(parent).unwrap().check().unwrap();
+        host.map_window(child).unwrap().check().unwrap();
+        let conn = X11Connection::new().unwrap();
+        conn.register_tree_structure_events().unwrap().check().unwrap();
+        let state = AncestorVisibilityState::discover(&conn, NonZeroU32::new(child).unwrap(), true)
+            .unwrap();
+        assert!(state.own_window_is_viewable());
+        host.reparent_window(parent, hidden, 0, 0).unwrap().check().unwrap();
+        let pump_until = |predicate: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !predicate() && Instant::now() < deadline {
+                while let Some(event) = conn.conn.poll_for_event().unwrap() {
+                    match event {
+                        Event::ReparentNotify(e) => state.window_reparented(
+                            NonZeroU32::new(e.window).unwrap(),
+                            NonZeroU32::new(e.parent),
+                            &conn,
+                        ),
+                        Event::MapNotify(e) => {
+                            state.window_mapped(NonZeroU32::new(e.window).unwrap());
+                        }
+                        Event::UnmapNotify(e) => {
+                            state.window_unmapped(NonZeroU32::new(e.window).unwrap())
+                        }
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(predicate(), "visibility did not reach expected state");
+        };
+        pump_until(&|| !state.own_window_is_viewable());
+        host.map_window(hidden).unwrap().check().unwrap();
+        pump_until(&|| state.own_window_is_viewable());
+        host.unmap_window(hidden).unwrap().check().unwrap();
+        pump_until(&|| !state.own_window_is_viewable());
+        host.map_window(hidden).unwrap().check().unwrap();
+        pump_until(&|| state.own_window_is_viewable());
+        host.destroy_window(hidden).unwrap().check().unwrap();
+    }
+}
